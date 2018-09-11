@@ -1,0 +1,8 @@
+src/github.com
+src/isubata/vendor
+/pkg/
+/isubata
+.vscode
+
+*.swp
+*.swo
