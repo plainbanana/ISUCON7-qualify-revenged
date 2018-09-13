@@ -17,6 +17,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-redis/redis"
@@ -36,7 +37,15 @@ var (
 	db            *sqlx.DB
 	redisCli      *redis.Client
 	ErrBadReqeust = echo.NewHTTPError(http.StatusBadRequest)
+	chanMessages  = make(chan chMessage, 1000)
+	muMsg         sync.Mutex
 )
+
+type chMessage struct {
+	userID   int64
+	chanID   int64
+	messages []Message
+}
 
 type Renderer struct {
 	templates *template.Template
@@ -414,13 +423,66 @@ func getMessage(c echo.Context) error {
 		response = append(response, r)
 	}
 
-	if len(messages) > 0 {
-		_, err := db.Exec("INSERT INTO haveread (user_id, channel_id, message_id, updated_at, created_at)"+
-			" VALUES (?, ?, ?, NOW(), NOW())"+
-			" ON DUPLICATE KEY UPDATE message_id = ?, updated_at = NOW()",
-			userID, chanID, messages[0].ID, messages[0].ID)
-		if err != nil {
-			return err
+	var msg chMessage
+	msg.userID, msg.chanID, msg.messages = userID, chanID, messages
+	chanMessages <- msg
+	timeout := time.After(50 * time.Millisecond)
+	muMsg.Lock()
+	defer muMsg.Unlock()
+	select {
+	default:
+		fmt.Println("no capacity!")
+	case m, ok := <-chanMessages:
+		if !ok {
+			count := 0
+			sqlStr := "INSERT INTO haveread (user_id, channel_id, message_id, updated_at, created_at) "
+			vals := []interface{}{}
+			if len(chanMessages) >= 1 {
+				for msg := range chanMessages {
+					if len(msg.messages) > 0 {
+						if count == 0 {
+							sqlStr += " VALUES (?, ?, ?, NOW(), NOW()),"
+							vals = append(vals, m.userID, m.chanID, m.messages[0].ID)
+						}
+						sqlStr += " VALUES (?, ?, ?, NOW(), NOW()),"
+						vals = append(vals, msg.userID, msg.chanID, msg.messages[0].ID)
+						count++
+					}
+				}
+			} else {
+				if len(msg.messages) > 0 {
+					sqlStr += " VALUES (?, ?, ?, NOW(), NOW()),"
+					vals = append(vals, m.userID, m.chanID, m.messages[0].ID)
+				}
+			}
+			str3 := " ON DUPLICATE KEY UPDATE message_id = VALUES(message_id), updated_at = VALUES(updated_at)"
+			sqlStr = strings.TrimSuffix(sqlStr, ",") + str3
+			fmt.Println("vals : ", vals)
+			fmt.Println("sqlstr : ", sqlStr)
+			_, err := db.Exec(sqlStr, vals...)
+			if err != nil {
+				return err
+			}
+			fmt.Println("INSERT : exec ", count+1, " INSERTs at once")
+			// stmt, err := db.Prepare(sqlStr)
+			// if err != nil {
+			// 	fmt.Println("stmt error", err)
+			// }
+			// if _, err := stmt.Exec(vals...); err != nil {
+			// 	fmt.Println("stmt exec error", err)
+			// } else {
+			// 	fmt.Println("INSERT : exec ", count+1, " INSERTs at once")
+			// }
+		}
+	case <-timeout:
+		if len(messages) > 0 {
+			_, err := db.Exec("INSERT INTO haveread (user_id, channel_id, message_id, updated_at, created_at)"+
+				" VALUES (?, ?, ?, NOW(), NOW())"+
+				" ON DUPLICATE KEY UPDATE message_id = ?, updated_at = NOW()",
+				userID, chanID, messages[0].ID, messages[0].ID)
+			if err != nil {
+				return err
+			}
 		}
 	}
 
@@ -755,6 +817,7 @@ func tRange(a, b int64) []int64 {
 }
 
 func main() {
+	defer close(chanMessages)
 	e := echo.New()
 	funcs := template.FuncMap{
 		"add":    tAdd,
