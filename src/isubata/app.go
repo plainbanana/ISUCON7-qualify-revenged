@@ -20,6 +20,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gocraft/dbr/dialect"
+
+	"github.com/gocraft/dbr"
+
 	"github.com/go-redis/redis"
 	"github.com/go-sql-driver/mysql"
 	"github.com/gorilla/sessions"
@@ -43,6 +47,14 @@ var (
 	once              sync.Once
 	muMsg             sync.Mutex
 )
+
+type HaveReadChan struct {
+	UserID    int64     `db:"user_id"`
+	ChannelID int64     `db:"channel_id"`
+	MessageID int64     `db:"message_id"`
+	UpdatedAt time.Time `db:"updated_at"`
+	CreatedAt time.Time `db:"created_at"`
+}
 
 type chMessage struct {
 	userID   int64
@@ -103,6 +115,9 @@ func init() {
 	db.SetConnMaxLifetime(5 * time.Minute)
 	log.Printf("Succeeded to connect db.")
 
+	conn, _ := dbr.Open("mysql", dsn, nil)
+	sess := conn.NewSession(nil)
+
 	redisCli = redis.NewClient(&redis.Options{
 		Addr:     "localhost:6379",
 		Password: "", // no password set
@@ -112,69 +127,106 @@ func init() {
 	pong, err := redisCli.Ping().Result()
 	fmt.Println(pong, err)
 
-	go func() {
-		t := time.NewTicker(3 * time.Second)
-		for {
-			select {
-			case v := <-chanMessages:
-				timeout := time.After(2 * time.Second)
-				var num int
-			L:
-				for {
-					select {
-					case <-timeout:
-						break L
-					default:
-						num = int(len(chanMessages)) + 1
-						if num >= 2 {
-							break
+	// BULK INSERT
+	// set total number of goroutine
+	limit := 1
+	for i := 0; i < limit; i++ {
+		go func() {
+			t := time.NewTicker(1 * time.Second)
+			for {
+				select {
+				case v := <-chanMessages:
+					timeout := time.After(1 * time.Second)
+					var num int
+				L:
+					for {
+						select {
+						case <-timeout:
+							break L
+						default:
+							num = int(len(chanMessages)) + 1
+							if num >= 2 {
+								break
+							}
+							time.Sleep(1 * time.Millisecond)
 						}
-						time.Sleep(1 * time.Millisecond)
 					}
-				}
 
-				if num == 1 {
-					_, err := db.Exec("INSERT INTO haveread (user_id, channel_id, message_id, updated_at, created_at)"+
-						" VALUES (?, ?, ?, NOW(), NOW())"+
-						" ON DUPLICATE KEY UPDATE message_id = VALUES(message_id), updated_at = VALUES(updated_at)",
-						v.userID, v.chanID, v.messages[0].ID)
-					if err != nil {
-						break
+					// if num == 1 {
+					// 	_, err := db.Exec("INSERT INTO haveread (user_id, channel_id, message_id, updated_at, created_at)"+
+					// 		" VALUES (?, ?, ?, NOW(), NOW())"+
+					// 		" ON DUPLICATE KEY UPDATE message_id = VALUES(message_id), updated_at = VALUES(updated_at)",
+					// 		v.userID, v.chanID, v.messages[0].ID)
+					// 	if err != nil {
+					// 		break
+					// 	}
+					// 	chanRes <- 1
+					// 	break
+					// }
+
+					var tmp []chMessage
+					fmt.Println("!!!!!!!!!chan receive ", num)
+					for i := 0; i < num; i++ {
+						if i == 0 {
+							tmp = append(tmp, v)
+						} else {
+							if vv, ok := <-chanMessages; ok {
+								tmp = append(tmp, vv)
+							}
+						}
 					}
-					chanRes <- 1
+					// for i := 0; i < len(tmp); i += 2 {
+					// 	_, err := db.Exec("INSERT INTO haveread (user_id, channel_id, message_id, updated_at, created_at)"+
+					// 		" VALUES (?, ?, ?, NOW(), NOW()), (?, ?, ?, NOW(), NOW())"+
+					// 		" ON DUPLICATE KEY UPDATE message_id = VALUES(message_id), updated_at = VALUES(updated_at)",
+					// 		tmp[i].userID, tmp[i].chanID, tmp[i].messages[0].ID,
+					// 		tmp[i+1].userID, tmp[i+1].chanID, tmp[i+1].messages[0].ID)
+					// 	if err != nil {
+					// 		break
+					// 	}
+					// 	chanRes <- 1
+					// 	chanRes <- 1
+					// }
+
+					// https://github.com/gocraft/dbr/issues/44
+					// i have no idea why below code works
+					h := []HaveReadChan{}
+					for i := 0; i < len(tmp); i++ {
+						h = append(h, HaveReadChan{tmp[i].userID, tmp[i].chanID, tmp[i].messages[0].ID, time.Now(), time.Now()})
+						chanRes <- 1
+					}
+					stmt := sess.InsertInto("haveread").
+						Columns("user_id", "channel_id", "message_id", "updated_at", "created_at")
+					for _, val := range h {
+						stmt.Record(val)
+					}
+					buf := dbr.NewBuffer()
+					stmt.Build(dialect.MySQL, buf)
+					stmt2 := sess.
+						UpdateBySql(" ON DUPLICATE KEY UPDATE message_id = VALUES(message_id), updated_at = VALUES(updated_at)")
+					stmt2.Build(dialect.MySQL, buf)
+					query, interpolateErr := dbr.InterpolateForDialect(buf.String(), buf.Value(), dialect.MySQL)
+					if interpolateErr != nil {
+						fmt.Println(interpolateErr)
+					} else {
+						fmt.Println(query)
+					}
+					if result, insertErr := sess.InsertBySql(query).Exec(); insertErr != nil {
+						fmt.Println(err)
+					} else {
+						fmt.Println(result.RowsAffected())
+					}
+					// 	for i := 0; i < len(tmp); i++ {
+					// 	}
+					fmt.Println("!!!!!!!!!send ", len(tmp))
+				case <-t.C:
 					break
 				}
-
-				var tmp []chMessage
-				fmt.Println("!!!!!!!!!chan receive ", num)
-				for i := 0; i < 2; i++ {
-					if i == 0 {
-						tmp = append(tmp, v)
-					} else {
-						if vv, ok := <-chanMessages; ok {
-							tmp = append(tmp, vv)
-						}
-					}
-				}
-				for i := 0; i < len(tmp); i += 2 {
-					_, err := db.Exec("INSERT INTO haveread (user_id, channel_id, message_id, updated_at, created_at)"+
-						" VALUES (?, ?, ?, NOW(), NOW()), (?, ?, ?, NOW(), NOW())"+
-						" ON DUPLICATE KEY UPDATE message_id = VALUES(message_id), updated_at = VALUES(updated_at)",
-						tmp[i].userID, tmp[i].chanID, tmp[i].messages[0].ID,
-						tmp[i+1].userID, tmp[i+1].chanID, tmp[i+1].messages[0].ID)
-					if err != nil {
-						break
-					}
-					chanRes <- 1
-					chanRes <- 1
-				}
-				fmt.Println("!!!!!!!!!send ", len(tmp))
-			case <-t.C:
-				break
 			}
-		}
-		t.Stop()
-	}()
+			t.Stop()
+		}()
+		time.Sleep(130 * time.Millisecond)
+	}
 }
 
 type User struct {
@@ -501,55 +553,8 @@ func getMessage(c echo.Context) error {
 	select {
 	case <-chanRes:
 		return c.JSON(http.StatusOK, response)
-		// case <-sleep:
-		// 	count := 0
-		// 	sqlStr := "INSERT INTO haveread (user_id, channel_id, message_id, updated_at, created_at) "
-		// 	vals := []interface{}{}
-		// 	println("chanlong", len(chanMessages))
-		// 	if len(chanMessages) >= 1 {
-		// 		for {
-		// 			msg := <-chanMessages
-		// 			if len(msg.messages) > 0 {
-		// 				sqlStr += " VALUES (?, ?, ?, NOW(), NOW()),"
-		// 				vals = append(vals, msg.userID, msg.chanID, msg.messages[0].ID)
-		// 				count++
-		// 			}
-		// 			break
-		// 		}
-		// 	}
-		// 	str3 := " ON DUPLICATE KEY UPDATE message_id = VALUES(message_id), updated_at = NOW()"
-		// 	sqlStr = strings.TrimSuffix(sqlStr, ",") + str3
-		// 	fmt.Println("vals : ", vals)
-		// 	fmt.Println("sqlstr : ", sqlStr)
-		// 	// _, err := db.Exec(sqlStr, vals...)
-		// 	_, err := db.Exec(sqlStr, userID, chanID, messages[0].ID)
-		// 	if err != nil {
-		// 		return err
-		// 	}
-		// 	fmt.Println("INSERT : exec ", count, " INSERTs at once")
-		// 	return c.JSON(http.StatusOK, response)
-		// stmt, err := db.Prepare(sqlStr)
-		// if err != nil {
-		// 	fmt.Println("stmt error", err)
-		// }
-		// if _, err := stmt.Exec(vals...); err != nil {
-		// 	fmt.Println("stmt exec error", err)
-		// } else {
-		// 	fmt.Println("INSERT : exec ", count+1, " INSERTs at once")
-		// }
-		// case <-timeout:
-		// 	if len(messages) > 0 {
-		// 		_, err := db.Exec("INSERT INTO haveread (user_id, channel_id, message_id, updated_at, created_at)"+
-		// 			" VALUES (?, ?, ?, NOW(), NOW())"+
-		// 			" ON DUPLICATE KEY UPDATE message_id = ?, updated_at = NOW()",
-		// 			userID, chanID, messages[0].ID, messages[0].ID)
-		// 		if err != nil {
-		// 			return err
-		// 		}
-		// 	}
 	}
 
-	// return c.JSON(http.StatusOK, response)
 }
 
 func queryChannels() ([]int64, error) {
