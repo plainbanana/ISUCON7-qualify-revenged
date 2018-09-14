@@ -34,11 +34,14 @@ const (
 )
 
 var (
-	db            *sqlx.DB
-	redisCli      *redis.Client
-	ErrBadReqeust = echo.NewHTTPError(http.StatusBadRequest)
-	chanMessages  = make(chan chMessage, 1000)
-	muMsg         sync.Mutex
+	db                *sqlx.DB
+	redisCli          *redis.Client
+	ErrBadReqeust     = echo.NewHTTPError(http.StatusBadRequest)
+	chanMessages      = make(chan chMessage, 1000)
+	chanRes           = make(chan int, 1000)
+	chanMessagesSlice = make(chan []chMessage)
+	once              sync.Once
+	muMsg             sync.Mutex
 )
 
 type chMessage struct {
@@ -108,6 +111,70 @@ func init() {
 
 	pong, err := redisCli.Ping().Result()
 	fmt.Println(pong, err)
+
+	go func() {
+		t := time.NewTicker(3 * time.Second)
+		for {
+			select {
+			case v := <-chanMessages:
+				timeout := time.After(2 * time.Second)
+				var num int
+			L:
+				for {
+					select {
+					case <-timeout:
+						break L
+					default:
+						num = int(len(chanMessages)) + 1
+						if num >= 2 {
+							break
+						}
+						time.Sleep(1 * time.Millisecond)
+					}
+				}
+
+				if num == 1 {
+					_, err := db.Exec("INSERT INTO haveread (user_id, channel_id, message_id, updated_at, created_at)"+
+						" VALUES (?, ?, ?, NOW(), NOW())"+
+						" ON DUPLICATE KEY UPDATE message_id = VALUES(message_id), updated_at = VALUES(updated_at)",
+						v.userID, v.chanID, v.messages[0].ID)
+					if err != nil {
+						break
+					}
+					chanRes <- 1
+					break
+				}
+
+				var tmp []chMessage
+				fmt.Println("!!!!!!!!!chan receive ", num)
+				for i := 0; i < 2; i++ {
+					if i == 0 {
+						tmp = append(tmp, v)
+					} else {
+						if vv, ok := <-chanMessages; ok {
+							tmp = append(tmp, vv)
+						}
+					}
+				}
+				for i := 0; i < len(tmp); i += 2 {
+					_, err := db.Exec("INSERT INTO haveread (user_id, channel_id, message_id, updated_at, created_at)"+
+						" VALUES (?, ?, ?, NOW(), NOW()), (?, ?, ?, NOW(), NOW())"+
+						" ON DUPLICATE KEY UPDATE message_id = VALUES(message_id), updated_at = VALUES(updated_at)",
+						tmp[i].userID, tmp[i].chanID, tmp[i].messages[0].ID,
+						tmp[i+1].userID, tmp[i+1].chanID, tmp[i+1].messages[0].ID)
+					if err != nil {
+						break
+					}
+					chanRes <- 1
+					chanRes <- 1
+				}
+				fmt.Println("!!!!!!!!!send ", len(tmp))
+			case <-t.C:
+				break
+			}
+		}
+		t.Stop()
+	}()
 }
 
 type User struct {
@@ -425,68 +492,64 @@ func getMessage(c echo.Context) error {
 
 	var msg chMessage
 	msg.userID, msg.chanID, msg.messages = userID, chanID, messages
+	if len(msg.messages) <= 0 {
+		return c.JSON(http.StatusOK, response)
+	}
 	chanMessages <- msg
-	timeout := time.After(50 * time.Millisecond)
-	muMsg.Lock()
-	defer muMsg.Unlock()
+	// timeout := time.After(5000 * time.Millisecond)
+	// sleep := time.After(5 * time.Millisecond)
 	select {
-	default:
-		fmt.Println("no capacity!")
-	case m, ok := <-chanMessages:
-		if !ok {
-			count := 0
-			sqlStr := "INSERT INTO haveread (user_id, channel_id, message_id, updated_at, created_at) "
-			vals := []interface{}{}
-			if len(chanMessages) >= 1 {
-				for msg := range chanMessages {
-					if len(msg.messages) > 0 {
-						if count == 0 {
-							sqlStr += " VALUES (?, ?, ?, NOW(), NOW()),"
-							vals = append(vals, m.userID, m.chanID, m.messages[0].ID)
-						}
-						sqlStr += " VALUES (?, ?, ?, NOW(), NOW()),"
-						vals = append(vals, msg.userID, msg.chanID, msg.messages[0].ID)
-						count++
-					}
-				}
-			} else {
-				if len(msg.messages) > 0 {
-					sqlStr += " VALUES (?, ?, ?, NOW(), NOW()),"
-					vals = append(vals, m.userID, m.chanID, m.messages[0].ID)
-				}
-			}
-			str3 := " ON DUPLICATE KEY UPDATE message_id = VALUES(message_id), updated_at = VALUES(updated_at)"
-			sqlStr = strings.TrimSuffix(sqlStr, ",") + str3
-			fmt.Println("vals : ", vals)
-			fmt.Println("sqlstr : ", sqlStr)
-			_, err := db.Exec(sqlStr, vals...)
-			if err != nil {
-				return err
-			}
-			fmt.Println("INSERT : exec ", count+1, " INSERTs at once")
-			// stmt, err := db.Prepare(sqlStr)
-			// if err != nil {
-			// 	fmt.Println("stmt error", err)
-			// }
-			// if _, err := stmt.Exec(vals...); err != nil {
-			// 	fmt.Println("stmt exec error", err)
-			// } else {
-			// 	fmt.Println("INSERT : exec ", count+1, " INSERTs at once")
-			// }
-		}
-	case <-timeout:
-		if len(messages) > 0 {
-			_, err := db.Exec("INSERT INTO haveread (user_id, channel_id, message_id, updated_at, created_at)"+
-				" VALUES (?, ?, ?, NOW(), NOW())"+
-				" ON DUPLICATE KEY UPDATE message_id = ?, updated_at = NOW()",
-				userID, chanID, messages[0].ID, messages[0].ID)
-			if err != nil {
-				return err
-			}
-		}
+	case <-chanRes:
+		return c.JSON(http.StatusOK, response)
+		// case <-sleep:
+		// 	count := 0
+		// 	sqlStr := "INSERT INTO haveread (user_id, channel_id, message_id, updated_at, created_at) "
+		// 	vals := []interface{}{}
+		// 	println("chanlong", len(chanMessages))
+		// 	if len(chanMessages) >= 1 {
+		// 		for {
+		// 			msg := <-chanMessages
+		// 			if len(msg.messages) > 0 {
+		// 				sqlStr += " VALUES (?, ?, ?, NOW(), NOW()),"
+		// 				vals = append(vals, msg.userID, msg.chanID, msg.messages[0].ID)
+		// 				count++
+		// 			}
+		// 			break
+		// 		}
+		// 	}
+		// 	str3 := " ON DUPLICATE KEY UPDATE message_id = VALUES(message_id), updated_at = NOW()"
+		// 	sqlStr = strings.TrimSuffix(sqlStr, ",") + str3
+		// 	fmt.Println("vals : ", vals)
+		// 	fmt.Println("sqlstr : ", sqlStr)
+		// 	// _, err := db.Exec(sqlStr, vals...)
+		// 	_, err := db.Exec(sqlStr, userID, chanID, messages[0].ID)
+		// 	if err != nil {
+		// 		return err
+		// 	}
+		// 	fmt.Println("INSERT : exec ", count, " INSERTs at once")
+		// 	return c.JSON(http.StatusOK, response)
+		// stmt, err := db.Prepare(sqlStr)
+		// if err != nil {
+		// 	fmt.Println("stmt error", err)
+		// }
+		// if _, err := stmt.Exec(vals...); err != nil {
+		// 	fmt.Println("stmt exec error", err)
+		// } else {
+		// 	fmt.Println("INSERT : exec ", count+1, " INSERTs at once")
+		// }
+		// case <-timeout:
+		// 	if len(messages) > 0 {
+		// 		_, err := db.Exec("INSERT INTO haveread (user_id, channel_id, message_id, updated_at, created_at)"+
+		// 			" VALUES (?, ?, ?, NOW(), NOW())"+
+		// 			" ON DUPLICATE KEY UPDATE message_id = ?, updated_at = NOW()",
+		// 			userID, chanID, messages[0].ID, messages[0].ID)
+		// 		if err != nil {
+		// 			return err
+		// 		}
+		// 	}
 	}
 
-	return c.JSON(http.StatusOK, response)
+	// return c.JSON(http.StatusOK, response)
 }
 
 func queryChannels() ([]int64, error) {
