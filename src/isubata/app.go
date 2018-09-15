@@ -39,6 +39,7 @@ const (
 
 var (
 	db                *sqlx.DB
+	sess              *dbr.Session
 	redisCli          *redis.Client
 	ErrBadReqeust     = echo.NewHTTPError(http.StatusBadRequest)
 	chanMessages      = make(chan chMessage, 1000)
@@ -116,7 +117,7 @@ func init() {
 	log.Printf("Succeeded to connect db.")
 
 	conn, _ := dbr.Open("mysql", dsn, nil)
-	sess := conn.NewSession(nil)
+	sess = conn.NewSession(nil)
 
 	redisCli = redis.NewClient(&redis.Options{
 		Addr:     "localhost:6379",
@@ -132,11 +133,14 @@ func init() {
 	limit := 1
 	for i := 0; i < limit; i++ {
 		go func() {
-			t := time.NewTicker(1 * time.Second)
+			t := time.NewTicker(5 * time.Second)
 			for {
 				select {
 				case v := <-chanMessages:
-					timeout := time.After(1 * time.Second)
+					timeout := time.After(50 * time.Millisecond)
+					if int(len(chanMessages)) > 5 {
+						timeout = time.After(10 * time.Millisecond)
+					}
 					var num int
 				L:
 					for {
@@ -148,7 +152,6 @@ func init() {
 							if num >= 2 {
 								break
 							}
-							time.Sleep(1 * time.Millisecond)
 						}
 					}
 
@@ -193,7 +196,6 @@ func init() {
 					h := []HaveReadChan{}
 					for i := 0; i < len(tmp); i++ {
 						h = append(h, HaveReadChan{tmp[i].userID, tmp[i].chanID, tmp[i].messages[0].ID, time.Now(), time.Now()})
-						chanRes <- 1
 					}
 					stmt := sess.InsertInto("haveread").
 						Columns("user_id", "channel_id", "message_id", "updated_at", "created_at")
@@ -216,8 +218,9 @@ func init() {
 					} else {
 						fmt.Println(result.RowsAffected())
 					}
-					// 	for i := 0; i < len(tmp); i++ {
-					// 	}
+					for i := 0; i < len(tmp); i++ {
+						chanRes <- 1
+					}
 					fmt.Println("!!!!!!!!!send ", len(tmp))
 				case <-t.C:
 					break
@@ -533,13 +536,46 @@ func getMessage(c echo.Context) error {
 	}
 
 	response := make([]map[string]interface{}, 0)
+
+	ids := []int64{}
+	users := []User{}
 	for i := len(messages) - 1; i >= 0; i-- {
 		m := messages[i]
-		r, err := jsonifyMessage(m)
+		ids = append(ids, m.UserID)
+	}
+	_, err = sess.Select("id", "name", "display_name", "avatar_icon").From("user").Where("id IN ?", ids).Load(&users)
+	if err != nil {
+		fmt.Println("err", err)
+	}
+	userMap := make(map[int64]User)
+	for _, v := range users {
+		userMap[v.ID] = v
+	}
+	fmt.Println("users", len(users))
+	fmt.Println("userMap", len(userMap))
+	fmt.Println("userMap", userMap)
+	fmt.Println("ids", len(ids))
+	fmt.Println("ids", ids)
+	count := 0
+	for i := len(messages) - 1; i >= 0; i-- {
+		m := messages[i]
+
+		r := make(map[string]interface{})
+		r["id"] = m.ID
+		if val, ok := userMap[m.UserID]; ok {
+			r["user"] = val
+		} else {
+			u := User{}
+			r["user"] = u
+		}
+		r["date"] = m.CreatedAt.Format("2006/01/02 15:04:05")
+		r["content"] = m.Content
+
 		if err != nil {
 			return err
 		}
 		response = append(response, r)
+		count++
 	}
 
 	var msg chMessage
